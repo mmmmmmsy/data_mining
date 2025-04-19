@@ -3,6 +3,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
+from tqdm import tqdm
+import glob
+from datetime import timedelta
 
 plt.rcParams['font.family'] = 'SimHei'
 plt.rcParams['axes.unicode_minus'] = False
@@ -17,14 +20,13 @@ class DataAnalyzer:
 
         start_time = datetime.now()
 
-        #cols = ['user_name', 'chinese_name', 'age', 'income', 'credit_score', 'gender', 'country']
         parquet_pattern = os.path.join(self.data_dir, "*.parquet")
-        df = dd.read_parquet(parquet_pattern, chunksize="300MB")
+        df = dd.read_parquet(parquet_pattern, chunksize="1024MB")
 
         load_time = datetime.now() - start_time
         print(f"数据加载完成，耗时: {load_time}")
         #print(res_chunk.shape)
-        print("字段如下：", df.columns)
+        #print("字段如下：", df.columns)
 
         return df
 
@@ -34,9 +36,7 @@ class DataAnalyzer:
         print(f"开始抽样")
         start_time = datetime.now()
 
-        #total_size_bytes = 30 * 1024 ** 3
-        #sample_frac = (2 * 1024 ** 3) / total_size_bytes
-        sample_df = df.sample(frac=0.001).compute()
+        sample_df = df.sample(frac=0.01).compute()
 
         load_time = datetime.now() - start_time
         print(f"数据加载完成，耗时: {load_time}")
@@ -45,14 +45,14 @@ class DataAnalyzer:
         return sample_df
 
     #数据预处理
-    def preprocess_data(self, df):
-        print(f"\n{'=' * 50}")
+    def preprocess_data(self, df, i):
+        #print(f"\n{'=' * 50}")
         print(f"开始数据预处理")
         start_time = datetime.now()
-        #df = df["age", "income", "credit_score", "gender", "country", "user_name", "chinese_name"]
+        df = df.compute()
 
         '''数据缺失检测与处理'''
-        print(f"数据缺失检测与处理")
+        #print(f"数据缺失检测与处理")
 
         missing = df.isnull().sum()
         missing_pct = (missing / len(df)) * 100
@@ -60,14 +60,20 @@ class DataAnalyzer:
             '缺失值数量': missing,
             '缺失值比例(%)': [round(pct, 2) for pct in missing_pct]
         })
-        print(missing_report.sort_values('缺失值比例(%)', ascending=False))
+        missing_report.to_csv("missing_report.csv",encoding='utf-8', index=False, mode='a', header=False)
+        if i == 0:
+            missing_report.to_csv("missing_report.csv", encoding='utf-8', index=False, mode='w')
+        else:
+            with open("missing_report.csv", "a", encoding="utf-8") as f:
+                f.write(f"\n### 分块 {i + 1} ###\n")
+            missing_report.to_csv("missing_report.csv", encoding='utf-8', index=False, mode='a', header=True)
 
-        df = df.dropna(subset=["age", "income", "credit_score", "gender"])
+        df = df.dropna(subset=["age", "income",  "gender"])
 
         '''数据异常检测与处理'''
-        print(f"数据异常检测与处理：采用四分位距异常值检测法")
+        #print(f"数据异常检测与处理")
 
-        numeric_cols = ["age", "income", "credit_score"]
+        numeric_cols = ["age", "income"]
         outlier_report = pd.DataFrame()
 
         for col in numeric_cols:
@@ -77,109 +83,237 @@ class DataAnalyzer:
             lower_bound = q1 - 1.5 * iqr
             upper_bound = q3 + 1.5 * iqr
 
-            print("异常值边界：", lower_bound, upper_bound)
+            #print("异常值边界：", lower_bound, upper_bound)
 
             outliers = df[(df[col] < lower_bound) | (df[col] > upper_bound)]
+            #outliers = df[(df[col] < 0) | (df[col] > 90)]
             outlier_pct = (len(outliers) / len(df)) * 100
             outlier_report.loc[col, "异常值比例(%)"] = round(outlier_pct, 2)
-
             # 移除异常值
             df = df[(df[col] >= lower_bound) & (df[col] <= upper_bound)]
+            #df = df[(df[col] >= 0) & (df[col] <= 90)]
 
-        print(outlier_report)
-        clean_size = len(df)
-        print("\nIQR 处理完成，清洗后数据量：", clean_size)
+        if i == 0:
+            outlier_report.to_csv("outlier_report.csv", encoding='utf-8', index=False, mode='w')
+        else:
+            with open("outlier_report.csv", "a", encoding="utf-8") as f:
+                f.write(f"\n### 分块 {i + 1} ###\n")
+            outlier_report.to_csv("outlier_report.csv", encoding='utf-8', index=False, mode='a', header=True)
 
         '''处理完毕'''
         load_time = datetime.now() - start_time
         print(f"数据预处理完成，耗时: {load_time}")
 
-        return df
+        return df, load_time
 
-    def visualize_data(self, df):
-        print(f"{'=' * 50}")
-        print(f"开始数据可视化")
-        print(type(df))
+    def visualize_all_data(self):
+        print(f"\n{'=' * 50}\n开始低内存整体数据可视化（逐块加载）")
         start_time = datetime.now()
 
-        '''年龄分布图'''
-        print(f"\n{'=' * 50}")
-        print(f"计算年龄分布图")
-        age_data = df["age"]
-        plt.figure(figsize=(8, 5))
-        plt.hist(age_data, bins=30, edgecolor='black')
-        plt.title("年龄分布图")
-        plt.xlabel("年龄")
-        plt.ylabel("人数")
+        age_bins = list(range(0, 101, 5))
+        income_bins = list(range(0, 200001, 10000))
+        age_counts = [0] * (len(age_bins) - 1)
+        income_counts = [0] * (len(income_bins) - 1)
+        registration_counts = {}
+
+        for file_path in glob.glob("temp_clean_chunks/clean_chunk_*.csv"):
+            chunk = pd.read_csv(file_path)
+
+            # 年龄统计
+            if "age" in chunk.columns:
+                age_hist = pd.cut(chunk["age"], bins=age_bins, right=False).value_counts(sort=False)
+                for idx, count in age_hist.items():
+                    age_counts[idx.left // 5] += count
+
+            # 收入统计
+            if "income" in chunk.columns:
+                income_hist = pd.cut(chunk["income"], bins=income_bins, right=False).value_counts(sort=False)
+                for idx, count in income_hist.items():
+                    income_counts[idx.left // 10000] += count
+
+            # 注册时间统计
+            if "registration_date" in chunk.columns:
+                chunk["registration_date"] = pd.to_datetime(chunk["registration_date"], errors="coerce")
+                monthly_counts = chunk["registration_date"].dt.to_period("M").value_counts()
+                for month, count in monthly_counts.items():
+                    month_str = str(month)
+                    registration_counts[month_str] = registration_counts.get(month_str, 0) + count
+
+        # 绘图
+        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+        plt.subplots_adjust(hspace=0.4)
+
+        # 年龄分布
+        axs[0, 0].bar([f"{age_bins[i]}-{age_bins[i + 1] - 1}" for i in range(len(age_counts))], age_counts,
+                      color='skyblue', edgecolor='black')
+        axs[0, 0].set_title("年龄分布")
+        axs[0, 0].set_xlabel("年龄区间")
+        axs[0, 0].set_ylabel("人数")
+        axs[0, 0].tick_params(axis='x', rotation=45)
+
+        # 收入分布
+        axs[0, 1].bar([f"{income_bins[i]}-{income_bins[i + 1] - 1}" for i in range(len(income_counts))], income_counts,
+                      color='lightgreen', edgecolor='black')
+        axs[0, 1].set_title("收入分布")
+        axs[0, 1].set_xlabel("收入区间")
+        axs[0, 1].set_ylabel("人数")
+        axs[0, 1].tick_params(axis='x', rotation=45)
+
+        # 注册时间趋势
+        if registration_counts:
+            sorted_months = sorted(registration_counts.items())
+            months, counts = zip(*sorted_months)
+            axs[1, 0].bar(months, counts, color='orange')
+            axs[1, 0].set_title("月度注册用户数")
+            axs[1, 0].set_xlabel("月份")
+            axs[1, 0].set_ylabel("注册人数")
+            axs[1, 0].tick_params(axis='x', rotation=45)
+
+        plt.suptitle("整体数据可视化", y=1.02)
+        plt.tight_layout()
         plt.show()
 
-        '''国家分布图'''
-        print(f"\n{'=' * 50}")
-        print(f"国家分布图")
-        country_counts = df['country'].value_counts()
+        elapsed = datetime.now() - start_time
+        print(f"可视化完成，用时：{elapsed}")
 
-        top_countries = country_counts.head(10)
-        other_countries = country_counts.tail(-10).sum()
-        if other_countries != 0:
-            top_countries["其他国家"] = other_countries
-
-        plt.figure(figsize=(8, 8))
-        plt.pie(top_countries, labels=top_countries.index, autopct='%1.1f%%', startangle=90,
-                colors=plt.cm.Paired.colors)
-        plt.title("按国家分布的用户占比")
-        plt.axis('equal')
-        plt.show()
-
-        '''收入分布图'''
-        print(f"\n{'=' * 50}")
-        print(f"收入分布图")
-        income_data = df["income"]
-        plt.figure(figsize=(8, 5))
-        plt.hist(income_data, bins=30, edgecolor='black')
-        plt.title("收入分布图")
-        plt.xlabel("收入")
-        plt.ylabel("人数")
-        plt.show()
-
-        load_time = datetime.now() - start_time
-        print(f"数据可视化完成，耗时: {load_time}")
+    # def visualize_all_data(self, df):
+    #     print(f"\n{'=' * 50}")
+    #     print(f"开始整体数据可视化")
+    #     start_time = datetime.now()
+    #
+    #     plt.figure(figsize=(15, 10))
+    #     plt.subplots_adjust(hspace=0.4)
+    #
+    #     # 年龄分布
+    #     plt.subplot(2, 2, 1)
+    #     plt.hist(df["age"], bins=30, edgecolor='black', color='skyblue')
+    #     plt.title("年龄分布")
+    #     plt.xlabel("年龄")
+    #     plt.ylabel("人数")
+    #
+    #     # 收入分布
+    #     plt.subplot(2, 2, 2)
+    #     plt.hist(df["income"], bins=30, edgecolor='black', color='lightgreen')
+    #     plt.title("收入分布")
+    #     plt.xlabel("收入")
+    #     plt.ylabel("人数")
+    #
+    #     # 注册时间趋势
+    #     plt.subplot(2, 2, 3)
+    #     if 'registration_date' in df.columns:
+    #         df["registration_date"] = pd.to_datetime(df["registration_date"], errors='coerce')
+    #         df = df.dropna(subset=["registration_date"])
+    #         monthly_counts = df["registration_date"].dt.to_period("M").value_counts().sort_index()
+    #         monthly_counts.index = monthly_counts.index.astype(str)
+    #         monthly_counts.plot(kind="bar", color='orange')
+    #         plt.title("月度注册用户数")
+    #         plt.xticks(rotation=45)
+    #         plt.xlabel("月份")
+    #         plt.ylabel("用户数")
+    #
+    #     plt.suptitle("整体数据可视化", y=1.02)
+    #     plt.tight_layout()
+    #     plt.show()
+    #
+    #     load_time = datetime.now() - start_time
+    #     print(f"可视化完成，耗时: {load_time}")
 
     def recognize_highused(self, df):
-        income_thresh = df["income"].quantile(0.75)
-        credit_thresh = df["credit_score"].quantile(0.75)
+        #print(f"\n{'=' * 50}")
+        print("识别高价值用户")
+        start_time = datetime.now()
 
-        high_value_users = df[
-            (df["income"] > income_thresh) &
-            (df["credit_score"] > credit_thresh)
-        ]
-        print(f"识别到高价值用户数量：{high_value_users.shape[0]}")
-        print("展示前5个高价值用户：")
-        print(high_value_users[["user_name","chinese_name", "age", "income", "credit_score"]].head(5))
+        current_date = pd.to_datetime(datetime.now().date())
+        df['registration_date'] = pd.to_datetime(df['registration_date'])
+        df['membership_days'] = (current_date - df['registration_date']).dt.days
+
+        def normalize(series, reverse=False):
+            if reverse:  # 用于注册时长（越久越好）
+                return (series.max() - series) / (series.max() - series.min() + 1e-10)
+            return (series - series.min()) / (series.max() - series.min() + 1e-10)
+
+        # 计算各项评分
+        df['income_score'] = normalize(df['income'])
+        df['age_score'] = df['age'].apply(lambda x: max(0, 1 - abs((x - 30) / 20)))  # 30岁为峰值
+        df['loyalty_score'] = normalize(df['membership_days'], reverse=True)  # 注册越久分越高
+
+        # 权重
+        df['hv_score'] = (
+                0.65 * df['income_score'] +  # 收入权重65%
+                0.05 * df['age_score'] +  # 年龄权重5%
+                0.3 * df['loyalty_score']  # 忠诚度权重30%
+        )
+
+        # 5. 获取前10名高价值用户
+        top_10_users = df.sort_values('hv_score', ascending=False).head(10)
+
+        # 6. 打印结果
+        #print("\n排名前10的高价值用户：")
+        #print(top_10_users[['user_name', 'fullname', 'age', 'income', 'registration_date', 'hv_score']].to_string(index=False))
+
+        load_time = datetime.now() - start_time
+        print(f"高价值用户识别完成，耗时: {load_time}")
+        print(f"\n{'=' * 50}")
+        return top_10_users, load_time
 
     def run(self):
         try:
-            # 1.数据加载和采样
+            # 1. 数据加载 - 保持惰性加载
             df = self.load_data()
+            progress_bar = tqdm(total=df.npartitions, desc="处理分块")
+            clean_len = 0
+            pre_time = timedelta()
+            reg_time = timedelta()
 
-            # 2.数据采样
-            df_sample = self.sample_data(df)
+            os.makedirs("temp_clean_chunks", exist_ok=True)
 
-            # 3.数据预处理
-            df_clean = self.preprocess_data(df_sample)
+            # 2. 分块处理数据
+            for i, partition in enumerate(df.partitions):
+                print(f"\n{'=' * 50}")
+                #print(f"正在处理第 {i + 1} 个数据分块...")
 
-            # 4.数据可视化
-            self.visualize_data(df_clean)
+                try:
+                    # 预处理当前分块
+                    df_clean, pre_time_part = self.preprocess_data(partition, i)  # 显式计算当前分块
+                    clean_len += len(df_clean)
+                    pre_time += pre_time_part
+                    # 检查处理后的数据是否为空
+                    if len(df_clean) == 0:
+                        print(f"第 {i + 1} 个分块清洗后无数据，跳过")
+                        continue
 
-            # 5.高价值用户识别
-            self.recognize_highused(df_clean)
+                    df_clean.to_csv(f"temp_clean_chunks/clean_chunk_{i}.csv",encoding='utf-8', index=False)
+
+                    # 识别高价值用户
+                    high_value_users, reg_time_part = self.recognize_highused(df_clean)
+                    reg_time += reg_time_part
+
+                    # 保存当前分块的高价值用户
+                    if i == 0:
+                        high_value_users.to_csv("high_value_users.csv", index=False, mode='w')  # 首次写入创建文件
+                    else:
+                        high_value_users.to_csv("high_value_users.csv", index=False, mode='a', header=False)  # 追加写入
+
+                    # 手动释放内存
+                    del df_clean, high_value_users
+                    progress_bar.update(1)
+
+                except Exception as e:
+                    print(f"第 {i + 1} 个分块处理异常: {str(e)}")
+                    continue
+            progress_bar.close()
+            print("清洗后的长度：", clean_len)
+            print("预处理总用时：", pre_time)
+            print("识别总用时：", reg_time)
+            self.visualize_all_data()
 
         except Exception as e:
-            print(str(e))
+            print(f"程序运行失败: {str(e)}")
 
 
 if __name__ == "__main__":
     # 数据集目录
-    data_dirs = './data/30G_data'
-
-    analyzer = DataAnalyzer(data_dirs)
+    data_dir = './data/30G_data/30G_data_new'
+    #data_dir = './data/test'
+    analyzer = DataAnalyzer(data_dir)
     analyzer.run()
